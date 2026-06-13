@@ -11,6 +11,7 @@ import collections
 import json
 import re
 import time
+import re
 import logging
 from typing import Any, AsyncGenerator, List, Dict, Optional, Set
 from urllib.parse import urlparse
@@ -254,6 +255,26 @@ def _email_read_summary_from_tool_output(raw: str) -> str:
         lines.append("")
         lines.append(body)
     return "\n".join(lines)
+_SENSITIVE_BEARER_RE = re.compile(
+    r"(?i)\b(authorization\s*[:=]\s*bearer\s+)[A-Za-z0-9._~+/=-]+"
+)
+_SENSITIVE_VALUE_RE = re.compile(
+    r"(?i)\b(password|passwd|pwd|token|api[_-]?key|secret)\b"
+    r"(\s*[:=]\s*)"
+    r"([^\s,;]+)"
+)
+
+
+def _redact_sensitive_text(value: object) -> str:
+    """Redact obvious credential values before surfacing tool output."""
+    if value is None:
+        return ""
+
+    text = str(value)
+    text = _SENSITIVE_BEARER_RE.sub(r"\1[redacted]", text)
+    return _SENSITIVE_VALUE_RE.sub(r"\1\2[redacted]", text)
+
+
 
 
 def _load_mcp_disabled_map() -> Dict[str, set]:
@@ -3835,6 +3856,7 @@ async def stream_agent_loop(
     # signatures + consecutive no-text tool rounds to bail early.
     _recent_call_sigs = collections.deque(maxlen=6)
     _stuck_rounds = 0
+    _MAX_STUCK_ROUNDS = 4  # consecutive no-progress rounds before loop-breaker bails
     # Frequency of each exact call signature (tool + args), for the runaway
     # backstop. Counting identical repeats — not distinct same-tool calls —
     # lets a legit batch (e.g. 18 calendar events at once) through.
@@ -4430,7 +4452,7 @@ async def stream_agent_loop(
             # promise: short response (<400 chars), no fenced code/answer,
             # and an action-intent phrase was matched. Long answers that
             # happen to contain "let me know" are not stalls.
-            _looks_like_promise = (
+            _promise_shape = (
                 not guide_only
                 and _intent_match is not None
                 and len(_intent_text) < 400
@@ -4522,7 +4544,7 @@ async def stream_agent_loop(
         # Distinct calls to one tool (a real batch) are legitimate work, so we
         # count identical call signatures, not raw per-tool-type totals.
         _runaway = _detect_runaway_call(_call_freq)
-        if _stuck_rounds >= 4 or _runaway:
+        if _stuck_rounds >= _MAX_STUCK_ROUNDS or _runaway:
             reason = (f"calling {_runaway} with identical arguments over and over" if _runaway
                       else "repeating the same tool calls without new progress")
             logger.warning(f"[agent] loop-breaker tripped on round {round_num} ({reason}); sig={_sig[:80]!r}")
@@ -4821,29 +4843,29 @@ async def stream_agent_loop(
                 # empty) stdout/stderr; fall back to the error so the "timed
                 # out" reason reaches the UI instead of a blank result.
                 raw = result["stdout"] or result["stderr"] or result.get("error", "")
-                output_text = _truncate(raw)
+                output_text = _truncate(_redact_sensitive_text(raw))
             elif "output" in result:
                 # bash / python canonical result: {"output": ..., "exit_code": ...}
                 raw = result["output"] or ""
-                output_text = _truncate(raw)
+                output_text = _truncate(_redact_sensitive_text(raw))
             elif "response" in result:
                 # AI interaction tools (chat_with_model, send_to_session)
                 label = result.get("model", result.get("session_name", "AI"))
-                output_text = _truncate(f"{label}: {result['response']}")
+                output_text = _truncate(_redact_sensitive_text(f"{label}: {result['response']}"))
             elif "content" in result:
-                output_text = _truncate(result["content"])
+                output_text = _truncate(_redact_sensitive_text(result["content"]))
             elif "results" in result:
-                output_text = _truncate(result["results"])
+                output_text = _truncate(_redact_sensitive_text(result["results"]))
             elif "session_id" in result and "name" in result:
                 output_text = f"Session created: {result['name']} (id: {result['session_id']})"
             elif "success" in result:
                 output_text = (
                     f"Written: {result.get('path', '')}"
                     if result["success"]
-                    else f"Error: {result.get('error', '')}"
+                    else f"Error: {_redact_sensitive_text(result.get('error', ''))}"
                 )
             elif "error" in result:
-                output_text = _truncate(result["error"])
+                output_text = _truncate(_redact_sensitive_text(result["error"]))
 
             # Emit tool_output (include ui_event data if present)
             tool_output_data = {"type": "tool_output", "tool": block.tool_type, "command": cmd_display, "output": output_text, "exit_code": result.get("exit_code")}
