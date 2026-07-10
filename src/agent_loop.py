@@ -686,8 +686,8 @@ _API_HOSTS = frozenset([
     "ollama.com", "api.venice.ai", "api.kimi.com",
     "api.githubcopilot.com",
 ])
-_MCP_KEYWORDS = frozenset(["mcp", "browse", "browser", "website", "calendar", "event", "email",
-                           "gmail", "screenshot", "navigate", "click", "miniflux", "rss", "feed"])
+_MCP_KEYWORDS = frozenset(["mcp", "browse", "browser", "website", "calendar", "calender", "callender", "callendar", "event", "email",
+                           "gmail", "screenshot", "navigate", "click", "miniflux", "rss", "feed", "research"])
 _ADMIN_SCHEMA_NAMES = frozenset([
     "manage_session", "manage_skills", "manage_tasks",
     "manage_endpoints", "manage_mcp", "manage_webhooks", "manage_tokens",
@@ -885,7 +885,7 @@ _CASUAL_OPENING_RE = re.compile(
 )
 _CASUAL_BLOCKLIST_RE = re.compile(
     r"\b(?:cookbook|serve|serving|launch|start|vllm|sglang|llama\.?cpp|ollama|"
-    r"download|model|email|document|doc|note|calendar|task|search|web|research|"
+    r"download|model|email|document|doc|note|calendar|calender|callender|callendar|task|search|web|research|"
     r"file|folder|repo|git|settings?|endpoint|api|token|mcp)\b",
     re.IGNORECASE,
 )
@@ -894,7 +894,7 @@ _EXPLICIT_CONTINUATION_RE = re.compile(
     r"yes|y|yeah|yep|ok|okay|sure|do it|go ahead|continue|carry on|"
     r"run it|launch it|start it|use that|that one|same|the same|"
     r"first|second|third|the first one|the second one|the third one|"
-    r"[123]|[abc]"
+    r"[123]|[abc]|proceed|yes please|yes please proceed|please proceed"
     # `\s*[.!?]*\s*$` put two \s-matching quantifiers around `[.!?]*`, which
     # backtracks O(n^2) on a terse reply + whitespace flood (py/polynomial-redos).
     # `\s*(?:[.!?]+\s*)?$` accepts the same "trailing space/punctuation" tails
@@ -1013,13 +1013,13 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
 
     if has(r"\b(cookbook|serve|serving|served|launch|start|preset|vllm|sglang|llama\.?cpp|ollama|download|downloading|pull|cached models?|running models?|model servers?|models? (?:are )?running|what models?|model picker|gpu box|kierkegaard|odysseus|ajax|qwen|gemma|llama|mistral|minimax)\b"):
         domains.add("cookbook")
-    if has(r"\b(emails?|mails?|gmail|inbox|reply|forward|cc|bcc|send email|compose email|draft email|message chris|message him|message her)\b"):
+    if has(r"\b(emails?|mails?|gmail|inbox|reply|forward|cc|bcc|send email|compose email|draft email|message chris|message him|message her|booking|bookings|hotel|hotels|flight|flights|trip|trips|reservation|reservations|ticket|tickets)\b"):
         domains.add("email")
     if has(r"\b(notes?|todos?|to-dos?|checklists?|task list|remind me|reminders?|buy|pickup|pick up)\b"):
         domains.add("notes_calendar_tasks")
     if has(r"\b(every day|every morning|every evening|recurring|automatically|cron|scheduled task|background task)\b"):
         domains.add("notes_calendar_tasks")
-    if has(r"\b(calendar|event|meeting|appointment|schedule)\b"):
+    if has(r"\b(calendar|calender|callender|callendar|calander|callander|event|meeting|appointment|schedule|booking|bookings|hotel|hotels|flight|flights|trip|trips|reservation|reservations|ticket|tickets)\b"):
         domains.add("notes_calendar_tasks")
     _code_write_intent = has(
         r"\b(?:python|javascript|typescript|java|c\+\+|cpp|c#|csharp|rust|go|golang|"
@@ -3263,6 +3263,12 @@ async def stream_agent_loop(
         r"\b[^.\n]{0,140}",
         re.IGNORECASE,
     )
+    _HOLDING_RE = re.compile(
+        r"(?:please\s+)?(?:hold\s+on|wait)\b|one\s+moment\b|just\s+a\s+(?:moment|second|minute)\b|"
+        r"\bi\s+am\s+(?:now\s+)?(?:reading|fetching|searching|investigating|scanning|processing)\b|"
+        r"\bi'?m\s+(?:now\s+)?(?:reading|fetching|searching|investigating|scanning|processing)\b",
+        re.IGNORECASE,
+    )
     _awaiting_user = False  # set by ask_user → end the turn and wait for a choice
 
     # Document streaming state (persists across rounds)
@@ -3767,6 +3773,24 @@ async def stream_agent_loop(
             yield f'data: {json.dumps({"delta": cleaned_round})}\n\n'
 
         if not tool_blocks:
+            # ── Check for failed native tool calls ────────────────────
+            if native_tool_calls and not _force_answer:
+                failed_names = [tc.get("name", "") for tc in native_tool_calls]
+                _allowed_names = sorted([t.get("function", {}).get("name") for t in (all_tool_schemas or []) if t.get("function")])
+                _allowed_str = ", ".join(_allowed_names) if _allowed_names else "none available"
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        f"Error: You attempted to call tools: {failed_names}. "
+                        f"However, these tools do not exist or are not available in this turn. "
+                        f"Available tools you can call: {_allowed_str}. "
+                        "Please choose a valid tool from this list (for example, use `app_api` to reach email, calendar, or other UI endpoints) or respond directly to the user with text."
+                    )
+                })
+                logger.info(f"[agent] native tool calls failed to convert ({failed_names}). Nudging and looping again.")
+                yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
+                continue
+
             # ── Completion verifier (mechanism 3a) ────────────────────
             # The model is finishing. If this was an effectful agentic turn,
             # have a fresh-context verifier independently check the work
@@ -3820,33 +3844,45 @@ async def stream_agent_loop(
             # tool doesn't pin us in a forever loop.
             _intent_text = _strip_think_blocks(cleaned_round).strip()
             _intent_match = _INTENT_RE.search(_intent_text) if _intent_text else None
+            _has_holding = bool(_intent_text and _HOLDING_RE.search(_intent_text))
             # Only nudge when the round REALLY looks like an unfinished
             # promise: short response (<400 chars), no fenced code/answer,
             # and an action-intent phrase was matched. Long answers that
             # happen to contain "let me know" are not stalls.
+            # However, if a holding/waiting pattern is matched, we bypass
+            # the length restriction because "please hold" or "I am reading"
+            # without tools always stalls the run regardless of response length.
             _looks_like_promise = (
                 not guide_only
-                and _intent_match is not None
-                and len(_intent_text) < 400
+                and (_intent_match is not None or _has_holding)
+                and (len(_intent_text) < 400 or _has_holding)
                 and "```" not in _intent_text
                 and _intent_nudge_count < _MAX_INTENT_NUDGES
             )
             if _looks_like_promise:
                 _intent_nudge_count += 1
-                _matched_phrase = _intent_match.group(0).strip()
-                logger.info(f"[agent] intent-without-action nudge #{_intent_nudge_count} on round {round_num}: {_matched_phrase!r}")
-                _lower_phrase = _matched_phrase.lower()
-                _cookbook_log_hint = ""
-                if any(_word in _lower_phrase for _word in ("log", "logs", "output", "tail", "status")):
-                    _cookbook_log_hint = (
-                        " If this is about a Cookbook/model serve, the concrete calls are: "
-                        "`list_served_models` first, then `tail_serve_output` with the "
-                        "session_id from the serve/list result. Never answer with "
-                        "\"check logs\" when those tools are available."
+                if _has_holding:
+                    logger.info(f"[agent] intent-without-action holding pattern nudge #{_intent_nudge_count} on round {round_num}")
+                    _nudge_msg = (
+                        "You wrote a holding/waiting pattern or stated that you are currently performing "
+                        "an action (e.g. reading, searching, wait, hold on) but ended the turn without making any tool calls. "
+                        "In this environment, you must emit the tool calls (such as `read_email` with the relevant UIDs) "
+                        "directly in the same turn so they can execute. You cannot 'hold' or 'wait' for a future turn "
+                        "without calling a tool first. Call the actual tools now to continue the task."
                     )
-                messages.append({
-                    "role": "system",
-                    "content": (
+                else:
+                    _matched_phrase = _intent_match.group(0).strip()
+                    logger.info(f"[agent] intent-without-action nudge #{_intent_nudge_count} on round {round_num}: {_matched_phrase!r}")
+                    _lower_phrase = _matched_phrase.lower()
+                    _cookbook_log_hint = ""
+                    if any(_word in _lower_phrase for _word in ("log", "logs", "output", "tail", "status")):
+                        _cookbook_log_hint = (
+                            " If this is about a Cookbook/model serve, the concrete calls are: "
+                            "`list_served_models` first, then `tail_serve_output` with the "
+                            "session_id from the serve/list result. Never answer with "
+                            "\"check logs\" when those tools are available."
+                        )
+                    _nudge_msg = (
                         f"You just wrote: \"{_matched_phrase}\" — but ended the "
                         "turn without making the actual tool call. The user can "
                         "see you announced the action but didn't run it, which "
@@ -3855,7 +3891,11 @@ async def stream_agent_loop(
                         f"{_cookbook_log_hint}"
                         "If you decided not to do it after all, say so plainly in "
                         "one sentence instead of restating the plan."
-                    ),
+                    )
+
+                messages.append({
+                    "role": "system",
+                    "content": _nudge_msg,
                 })
                 # Visible signal in the stream so the user knows we caught it.
                 yield f'data: {json.dumps({"type": "agent_step", "round": round_num + 1})}\n\n'
